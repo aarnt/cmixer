@@ -1,0 +1,219 @@
+#!/usr/bin/perl
+
+# Copyright (c) 2009, 2012, 2020 Landry Breuil <landry@openbsd.org>
+# Copyright (c) 2020 Alexandre Ratchov <alex@caoua.org>
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+use strict;
+use warnings;
+
+my $m = OpenBSD::CMixer->new();
+$m->run();
+
+package OpenBSD::CMixer;
+use Curses;
+use Curses::UI;
+use Curses::UI::Common;
+
+sub new {
+	my($class) = @_;
+	my $self = bless {}, $class;
+	$self->{name} ="CMixer v0.3";
+	return $self;
+}
+
+sub read_sndioctl {
+	my $self = shift;
+	my $dir;
+
+	foreach (`sndioctl -v`) {
+		# foo/bar.level[1]=0.43
+		if (/^(.+\/|)([a-z0-9]+)(\[[0-9]+\]|)\.(.+)=([\.0-9]+).*/) {
+
+			#
+			# use group as $dir field, as it must be a non-empty
+			# string, rename the top-level group to "/"
+			if ($1 eq "") {
+				$dir = "/";
+			} else {
+				$dir = $1;
+			}
+
+			#
+			# we don't care about channels. If there are channels
+			# use the first one only to avoid "duplicate" entries
+			#
+			if ($3 ne "" && $3 ne "[0]") {
+				next;
+			}
+
+			# we support only "level" and "mute" functions
+			if ($4 ne "level" && $4 ne "mute") {
+				next;
+			}
+
+			$self->{mixer}{$dir}{$2}{$4} = $5;
+		}
+	}
+	die "No outputs found" unless (exists $self->{mixer}{"/"});
+}
+
+sub update_view {
+	my $self = shift;
+	foreach my $dir (keys %{$self->{mixer}}) {
+		foreach my $wid (keys %{$self->{mixer}{$dir}}) {
+			my $v = $self->{mixer}{$dir}{$wid}{level};
+			next if !exists($self->{wid}{"$dir.$wid.progress"});
+			$self->{wid}{"$dir.$wid.progress"}->pos($v * 100);
+			if ((exists $self->{mixer}{$dir}{$wid}{mute} && $self->{mixer}{$dir}{$wid}{mute} eq "1") ||
+				(!exists $self->{mixer}{$dir}{$wid}{mute} && $v == 0))
+				{ $self->{wid}{"$dir.$wid.mute"}->uncheck; }
+			else
+				{ $self->{wid}{"$dir.$wid.mute"}->check; }
+		}
+	}
+}
+
+sub update_vol {
+	my ($self, $off, $dir, $wid) = @_;
+	my $v = $self->{mixer}{$dir}{$wid}{level};
+	my $grp;
+
+	# save previous value, needed when muting a widget without mute control
+	$self->{mixer}{$dir}{$wid}{previous} = $v;
+	$v += $off;
+	if ($v > 1.) {
+		$v = 1.;
+	}
+	if ($v < 0.) {
+		$v = 0.;
+	}
+	$self->{wid}{"$dir.$wid.progress"}->pos($v * 100);
+
+	if ($dir eq "/") {
+		$grp = "";
+	} else {
+		$grp = $dir;
+	}
+	qx/sndioctl $grp$wid.level=$v/;
+	# update vol with new value
+	my $new = qx/sndioctl $grp$wid.level/;
+	if ($new =~ /^$grp$wid.level=([0-9\.]+)/) {
+		$self->{mixer}{$dir}{$wid}{level} = $1;
+	}
+}
+
+sub toggle_mute {
+	my ($self, $dir, $wid) = @_;
+	my $g;
+
+	$self->{wid}{"$dir.$wid.mute"}->toggle;
+	if (exists $self->{mixer}{$dir}{$wid}{mute}) {
+		if ($dir eq "/") {
+			$g = "";
+		} else {
+			$g = $dir;
+		}
+		qx/sndioctl $g$wid.mute=!/;
+	# handle mute toggle when no mute ctrl is present
+	} else {
+		my $v = $self->{mixer}{$dir}{$wid}{level};
+		my $oldv = $self->{mixer}{$dir}{$wid}{previous} // 100;
+		# if vol is not 0 & now unchecked, and update_vol(0)
+		if ($v != 0 && !$self->{wid}{"$dir.$wid.mute"}->get) {
+			$self->update_vol(-$v,$dir,$wid);
+		} elsif (defined $self->{mixer}{$dir}{$wid}{previous}){
+		# else update_vol(prev value)
+			$self->update_vol($self->{mixer}{$dir}{$wid}{previous},$dir,$wid);
+		}
+	}
+}
+
+sub loose_focus {
+	my ($self, $dir, $off) = @_;
+	$self->{"$dir.checkbox_current"} += $off;
+	$self->{"$dir.checkbox_current"} %= @{$self->{wid}{"$dir.checkbox_list"}};
+	$self->{wid}{"$dir.checkbox_list"}[$self->{"$dir.checkbox_current"}]->focus();
+}
+
+sub create_view {
+	my $self = shift;
+	$self->{wid}{cui} = new Curses::UI(
+		-clear_on_exit => 1,
+		-color_support => 1);
+	$self->{wid}{main_win} = $self->{wid}{cui}->add(
+		'main_win', 'Window',
+		-ipad => 1,
+		-title => $self->{name},
+		-titlereverse => 0,
+		-border => 1);
+	my $h = $self->{wid}{main_win}->height;
+	$self->{wid}{notebook} = $self->{wid}{main_win}->add(
+		'notebook', 'Notebook',
+		-y => 2); #40); # $self->{wid}{main_win}->height - 3);
+	foreach my $dir (sort keys %{$self->{mixer}}) {
+		my $y = 0;
+		# create container for this dir list
+		$self->{wid}{"$dir.page"} = $self->{wid}{notebook}->add_page(
+			"$dir",
+			-on_activate => sub {$self->loose_focus($dir, 0)});
+
+		foreach my $wid (sort keys %{$self->{mixer}{$dir}}) {
+			$self->{wid}{"$dir.$wid.label"} = $self->{wid}{"$dir.page"}->add(
+				"$dir.$wid.label", "Label",
+				-y => $y,
+				-text => "$wid");
+			$self->{wid}{"$dir.$wid.mute"} = $self->{wid}{"$dir.page"}->add(
+				"$dir.$wid.mute", "Checkbox",
+				-y => $y, -x => 14);
+			
+			# Changes in arrow key binding behaviour + add "," and "." bindings
+			$self->{wid}{"$dir.$wid.mute"}->set_binding( sub {$self->update_vol(0.01, $dir,$wid) }, ("l", KEY_RIGHT()));
+			$self->{wid}{"$dir.$wid.mute"}->set_binding( sub {$self->update_vol(0.1, $dir,$wid) }, ".");
+			$self->{wid}{"$dir.$wid.mute"}->set_binding( sub {$self->update_vol(-0.01, $dir,$wid) }, ("h", KEY_LEFT()));
+			$self->{wid}{"$dir.$wid.mute"}->set_binding( sub {$self->update_vol(-0.1, $dir,$wid) }, ",");
+			
+			$self->{wid}{"$dir.$wid.mute"}->clear_binding('loose-focus');
+			$self->{wid}{"$dir.$wid.mute"}->set_binding( sub {$self->loose_focus($dir,1) }, ("j", KEY_DOWN(), CUI_TAB()));
+			$self->{wid}{"$dir.$wid.mute"}->set_binding( sub {$self->loose_focus($dir,-1) }, ("k", KEY_UP()));
+			$self->{wid}{"$dir.$wid.mute"}->clear_binding('toggle');
+			$self->{wid}{"$dir.$wid.mute"}->set_binding( sub {$self->toggle_mute($dir,$wid) }, CUI_SPACE());
+			push @{$self->{wid}{"$dir.checkbox_list"}}, $self->{wid}{"$dir.$wid.mute"};
+			$self->{"$dir.checkbox_current"} = 0;
+
+			$self->{wid}{"$dir.$wid.progress"} = $self->{wid}{"$dir.page"}->add(
+				"$dir.$wid.progress", 'Progressbar', -border=>0, -sbborder =>1,
+				-max => 100, -x => 18,  -y => $y);
+			$y += 2;
+		}
+	}
+	$self->{wid}{notebook}->activate_page("/") if (exists $self->{mixer}{hw});
+	$self->{wid}{"help_label"} = $self->{wid}{main_win}->add(
+		"help_label", "Label",
+		-x => 2, -y => 0,
+		-bold => 1,
+		-text => "[up/down] prev/next [space] toggle mute [left/right] down/up level [pgup/pgdown] prev/next tab [q] quit");
+	$self->{wid}{cui}->set_binding( sub { exit}, "q");
+}
+
+sub run {
+	my $self = shift;
+	$self->read_sndioctl();
+	$self->create_view();
+	$self->update_view();
+	# create timer & run C::UI
+	$self->{wid}{cui}->set_timer('timer', sub { $self->read_sndioctl; $self->update_view }, 1);
+	$self->{wid}{cui}->mainloop();
+}
+
