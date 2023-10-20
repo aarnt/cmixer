@@ -1,4 +1,4 @@
-# cmixer - A curses simple mixer for OpenBSD writen in perl
+# cmixer - A simple curses mixer for OpenBSD writen in perl
 
 This is derived work from [official OpenBSD package](https://openbsd.app/?search=cmixer) with 4 changes:
 
